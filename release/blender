@@ -1,0 +1,450 @@
+import bpy
+import math
+import mathutils
+
+# ==========================================
+# 1. ניקוי עמוק 
+# ==========================================
+for obj in bpy.data.objects: bpy.data.objects.remove(obj, do_unlink=True)
+for mesh in bpy.data.meshes: bpy.data.meshes.remove(mesh, do_unlink=True)
+for mat in bpy.data.materials: bpy.data.materials.remove(mat, do_unlink=True)
+bpy.app.handlers.depsgraph_update_post.clear() 
+
+# ==========================================
+# 2. שמיים ומנוע
+# ==========================================
+bpy.context.scene.render.engine = 'CYCLES'
+bpy.context.scene.cycles.device = 'GPU'
+
+world = bpy.data.worlds.get("World")
+if world:
+    world.use_nodes = True
+    bg_node = world.node_tree.nodes.get("Background")
+    if bg_node:
+        bg_node.inputs[0].default_value = (0.3, 0.5, 0.8, 1) 
+        bg_node.inputs[1].default_value = 0.3 
+
+# ==========================================
+# 3. מנגנון צבעים 
+# ==========================================
+def assign_material_v5(obj, mat_name, color, roughness=0.8, emission=0.0):
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(name=mat_name)
+        mat.use_nodes = True
+    
+    mat.diffuse_color = color
+    tree = mat.node_tree
+    
+    for node in tree.nodes: tree.nodes.remove(node)
+        
+    bsdf = tree.nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.location = (0, 0)
+    output = tree.nodes.new('ShaderNodeOutputMaterial')
+    output.location = (300, 0)
+    tree.links.new(bsdf.outputs[0], output.inputs[0])
+    
+    if "Base Color" in bsdf.inputs: bsdf.inputs["Base Color"].default_value = color
+    else: bsdf.inputs[0].default_value = color 
+    if "Roughness" in bsdf.inputs: bsdf.inputs['Roughness'].default_value = roughness
+    
+    if emission > 0:
+        if "Emission Color" in bsdf.inputs: bsdf.inputs["Emission Color"].default_value = color
+        if "Emission Strength" in bsdf.inputs: bsdf.inputs["Emission Strength"].default_value = emission
+            
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+    return mat
+
+# ==========================================
+# 4. פיזיקת השמש
+# ==========================================
+def update_sun_position(self, context):
+    scene = context.scene
+    sun = bpy.data.objects.get("Physical_Sun")
+    if not sun: return
+    
+    lat = math.radians(scene.sukkah_lat)
+    doy = (scene.sukkah_month - 1) * 30.4 + scene.sukkah_day
+    dec = math.radians(-23.44 * math.cos(math.radians((360.0 / 365.0) * (doy + 10))))
+    ha = math.radians(15.0 * (scene.sukkah_time - 12.0))
+    
+    alt = math.asin(math.sin(lat) * math.sin(dec) + math.cos(lat) * math.cos(dec) * math.cos(ha))
+    cos_alt = math.cos(alt)
+    if cos_alt < 0.001: cos_alt = 0.001
+    
+    cos_azi = (math.sin(dec) - math.sin(alt) * math.sin(lat)) / (cos_alt * math.cos(lat))
+    cos_azi = max(-1.0, min(1.0, cos_azi))
+    azi = math.acos(cos_azi)
+    
+    if ha > 0: azi = 2 * math.pi - azi
+        
+    sun.rotation_euler = (math.pi/2 - alt, 0, -azi)
+    
+    for area in context.screen.areas:
+        if area.type == 'VIEW_3D': area.tag_redraw()
+
+# ==========================================
+# 5. עדכון דינמי: מסגור ליניארי מובטח מתמטית
+# ==========================================
+def update_everything(scene, context):
+    w_req = scene.sukkah_width
+    l_req = scene.sukkah_length
+    count_x = max(1, round(w_req / 0.15))
+    count_y = max(1, round(l_req / 0.15))
+    actual_w = count_x * 0.15
+    actual_l = count_y * 0.15
+    wall_height = scene.sukkah_wall_height
+
+    wn = bpy.data.objects.get("Wall_North")
+    if wn:
+        wn.scale = (actual_w + 0.1, 0.05, wall_height)
+        wn.location = (0, actual_l / 2.0 + 0.025, wall_height / 2.0)
+        
+    ws = bpy.data.objects.get("Wall_South")
+    if ws:
+        ws.scale = (actual_w + 0.1, 0.05, wall_height)
+        ws.location = (0, -actual_l / 2.0 - 0.025, wall_height / 2.0)
+        
+    we = bpy.data.objects.get("Wall_East")
+    if we:
+        we.scale = (0.05, actual_l, wall_height)
+        we.location = (actual_w / 2.0 + 0.025, 0, wall_height / 2.0)
+        
+    ww = bpy.data.objects.get("Wall_West")
+    if ww:
+        ww.scale = (0.05, actual_l, wall_height)
+        ww.location = (-actual_w / 2.0 - 0.025, 0, wall_height / 2.0)
+
+    old_schach = bpy.data.objects.get("Schach_Board")
+    if old_schach: bpy.data.objects.remove(old_schach, do_unlink=True)
+
+    pct = scene.schach_hole_percent
+    tile_size = 0.15
+    target_hole_area = (tile_size * tile_size) * (pct / 100.0)
+    hole_side = math.sqrt(target_hole_area)
+
+    schach_z = wall_height - 0.025
+
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, schach_z)) 
+    tile = context.object
+    tile.name = "Schach_Board"
+    tile.scale = (0.15, 0.15, 0.05)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, schach_z))
+    cutter = context.object
+    cutter.scale = (hole_side, hole_side, 0.2)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+    bool_mod = tile.modifiers.new("Tile_Hole", 'BOOLEAN')
+    bool_mod.object = cutter
+    bool_mod.operation = 'DIFFERENCE'
+
+    context.view_layer.objects.active = tile
+    tile.select_set(True)
+    bpy.ops.object.modifier_apply(modifier="Tile_Hole")
+    bpy.data.objects.remove(cutter, do_unlink=True)
+
+    assign_material_v5(tile, "Wood_Schach", (0.35, 0.15, 0.05, 1), 0.7)
+    tile.location = (-actual_w / 2.0 + 0.075, -actual_l / 2.0 + 0.075, schach_z) 
+
+    arr_x = tile.modifiers.new("Array_X", 'ARRAY')
+    arr_x.count = count_x
+    arr_x.use_relative_offset = False
+    arr_x.use_constant_offset = True
+    arr_x.constant_offset_displace = (0.15, 0, 0)
+
+    arr_y = tile.modifiers.new("Array_Y", 'ARRAY')
+    arr_y.count = count_y
+    arr_y.use_relative_offset = False
+    arr_y.use_constant_offset = True
+    arr_y.constant_offset_displace = (0, 0.15, 0)
+
+    bpy.ops.object.modifier_apply(modifier="Array_X")
+    bpy.ops.object.modifier_apply(modifier="Array_Y")
+
+    # --- חישוב קרניים מנומלז ---
+    context.view_layer.update()
+    depsgraph = context.evaluated_depsgraph_get()
+    sun = bpy.data.objects.get("Physical_Sun")
+    
+    sun_hits = 0
+    schach_hits = 0
+    wall_hits = 0
+    total_samples = 0
+    
+    if sun:
+        sun_dir = sun.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 0.0, -1.0))
+        ray_dir = -sun_dir
+        ray_dir.normalize()
+
+        if ray_dir.z > 0:
+            steps = 35 
+            margin_w = min(0.1, actual_w * 0.02)
+            margin_l = min(0.1, actual_l * 0.02)
+            
+            for x in range(steps):
+                for y in range(steps):
+                    px = -actual_w/2.0 + margin_w + (x / (steps - 1)) * (actual_w - margin_w*2)
+                    py = -actual_l/2.0 + margin_l + (y / (steps - 1)) * (actual_l - margin_l*2)
+                    origin = mathutils.Vector((px, py, 0.1))
+                    
+                    hit, loc, normal, index, obj, matrix = scene.ray_cast(depsgraph, origin, ray_dir)
+                    total_samples += 1
+                    
+                    if not hit: 
+                        sun_hits += 1
+                    else:
+                        if obj and obj.name == "Schach_Board":
+                            schach_hits += 1
+                        elif obj and "Wall" in obj.name:
+                            wall_hits += 1
+
+    total_samples = max(1, total_samples)
+    sun_pct = (sun_hits / total_samples) * 100
+    shadow_pct = 100.0 - sun_pct  
+
+    total_shadow_hits = max(1, schach_hits + wall_hits)
+    schach_part = (schach_hits / total_shadow_hits) * shadow_pct
+    wall_part = (wall_hits / total_shadow_hits) * shadow_pct
+
+    # ==========================================
+    # בניית שלטים מתואמים - יחס ליניארי קשיח
+    # ==========================================
+    max_dim = max(actual_w, actual_l, wall_height)
+    t_scale = max_dim * 0.03
+    
+    box_h = t_scale * 1.5                  
+    box_depth = t_scale * 0.1             
+    text_extrude = t_scale * 0.02          
+    line_gap = t_scale * 2.8 
+    
+    # מיקום השלטים מוזז בקפידה קדימה
+    start_y = -actual_l / 2.0 - (t_scale * 3.0) 
+    
+    y_dims = start_y
+    y_schach = start_y - line_gap
+    y_shadow = start_y - line_gap * 2
+
+    # הטיית השלטים כדי שיפנו כלפי המצלמה בצורה קריאה וחלקה
+    tilt_angle = math.radians(25)
+    z_base = t_scale * 0.5
+
+    items = [
+        ("Dims", f"Sukkah Dimensions: {actual_w:.1f}m Width | {actual_l:.1f}m Length | {wall_height:.1f}m Height", y_dims),
+        ("Schach", f"Schach: {100 - pct}% Wood | {pct}% Holes", y_schach),
+        ("Shadow", f"Sun: {sun_pct:.1f}% | Shadow: {shadow_pct:.1f}% ({schach_part:.1f}% Schach, {wall_part:.1f}% Walls)", y_shadow)
+    ]
+
+    for prefix, text_str, y_pos in items:
+        txt_obj = bpy.data.objects.get(f"{prefix}_Meter")
+        bg_obj = bpy.data.objects.get(f"{prefix}_BG")
+        if txt_obj and bg_obj:
+            box_width = len(text_str) * t_scale * 0.55
+            
+            # קופסה שחורה בשיפוע
+            bg_obj.scale = (box_width, box_h, box_depth)
+            bg_obj.location = (0, y_pos, z_base)
+            bg_obj.rotation_euler = (tilt_angle, 0, 0)
+            
+            # טקסט בשיפוע מונח בדיוק על התיבה
+            txt_obj.scale = (t_scale, t_scale, t_scale)
+            txt_obj.data.body = text_str
+            txt_obj.data.extrude = text_extrude 
+            txt_obj.rotation_euler = (tilt_angle, 0, 0)
+            
+            z_offset = (box_depth / 2.0)
+            dy = -math.sin(tilt_angle) * z_offset
+            dz = math.cos(tilt_angle) * z_offset
+            
+            txt_obj.location = (0, y_pos + dy, z_base + dz)
+
+    # ==========================================
+    # מצלמה: קופסת גבולות ליניארית ומכפיל אבסולוטי
+    # ==========================================
+    cam = bpy.data.objects.get("Camera")
+    if cam:
+        # נקודות הקיצון האמיתיות של כל הסצנה (כולל הטקסט!)
+        bb_y_min = y_shadow - box_h
+        bb_y_max = actual_l / 2.0
+        bb_z_min = 0.0
+        bb_z_max = wall_height
+        
+        # מרכז הכובד שעליו המצלמה מתמקדת
+        mid_y = (bb_y_max + bb_y_min) / 2.0
+        mid_z = (bb_z_max + bb_z_min) / 2.0
+        
+        # חישוב הגודל הכולל ב-3 הצירים
+        total_size_x = max(actual_w, 85 * t_scale * 0.55) # רוחב הסוכה או הטקסט
+        total_size_y = bb_y_max - bb_y_min
+        total_size_z = bb_z_max - bb_z_min
+        
+        # מוצאים את המימד הכי גדול של "חבילת האובייקטים" המלאה
+        bound_max = max(total_size_x, total_size_y, total_size_z)
+        
+        # מכפיל 2.2 מבטיח לפחות 20% שוליים מכל כיוון בעדשת 35 מ"מ (מתמטית)
+        dist_needed = bound_max * 2.2
+        
+        cam.data.lens = 35 
+        cam.data.clip_start = 0.1 # מונע בעיות גזירה מקרוב
+        cam.data.clip_end = max(10000.0, dist_needed * 20.0) 
+        
+        # נסוגים אחורה (0.85 מהמרחק) ועולים למעלה (0.45 מהמרחק) לקבלת זווית יפה
+        cam_y = mid_y - (dist_needed * 0.85)
+        cam_z = mid_z + (dist_needed * 0.45)
+        
+        cam.location = (0, cam_y, cam_z)
+        
+        # המצלמה מסתכלת בול למרכז!
+        loc_cam = mathutils.Vector((0, cam_y, cam_z))
+        loc_tar = mathutils.Vector((0, mid_y, mid_z))
+        cam.rotation_euler = (loc_tar - loc_cam).to_track_quat('-Z', 'Y').to_euler()
+
+    # הגדלת רצפה כדי להבטיח אופק נקי
+    floor = bpy.data.objects.get("Floor")
+    if floor:
+        floor_size = max(1000.0, dist_needed * 15.0)
+        floor.scale = (floor_size, floor_size, 1)
+
+    for area in context.screen.areas:
+        if area.type == 'VIEW_3D':
+            for space in area.spaces:
+                if space.type == 'VIEW_3D':
+                    space.clip_end = max(10000.0, dist_needed * 20.0)
+
+# ==========================================
+# 6. ממשק UI 
+# ==========================================
+class SUKKAH_OT_update_all(bpy.types.Operator):
+    bl_idname = "sukkah.update_all"
+    bl_label = "Calculate Sun & Update Sukkah"
+    
+    def execute(self, context):
+        update_everything(context.scene, context)
+        return {'FINISHED'}
+
+class SUKKAH_OT_reset_defaults(bpy.types.Operator):
+    bl_idname = "sukkah.reset_defaults"
+    bl_label = "Reset to Defaults"
+    
+    def execute(self, context):
+        context.scene.sukkah_wall_height = 2.2
+        context.scene.sukkah_width = 3.0
+        context.scene.sukkah_length = 3.0
+        context.scene.schach_hole_percent = 50
+        context.scene.sukkah_lat = 31.77
+        context.scene.sukkah_month = 10
+        context.scene.sukkah_day = 15
+        context.scene.sukkah_time = 14.0
+        
+        update_sun_position(context, context)
+        update_everything(context.scene, context)
+        return {'FINISHED'}
+
+class SUKKAH_PT_panel(bpy.types.Panel):
+    bl_label = "Sukkah Master Controls"
+    bl_idname = "SUKKAH_PT_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Sukkah' 
+
+    def draw(self, context):
+        layout = self.layout
+        
+        box = layout.box()
+        box.label(text="Structure Properties:")
+        box.prop(context.scene, "sukkah_wall_height", text="Wall Height (m)")
+        box.prop(context.scene, "sukkah_width", text="Width X (m)")
+        box.prop(context.scene, "sukkah_length", text="Length Y (m)")
+        box.prop(context.scene, "schach_hole_percent", text="Schach Holes %")
+        
+        box2 = layout.box()
+        box2.label(text="Location & Date:")
+        box2.prop(context.scene, "sukkah_lat", text="Latitude (31.7=IL)")
+        box2.prop(context.scene, "sukkah_month", text="Month (1-12)")
+        box2.prop(context.scene, "sukkah_day", text="Day (1-31)")
+        box2.prop(context.scene, "sukkah_time", text="Time of Day")
+        
+        layout.separator()
+        layout.operator("sukkah.update_all", icon='OUTLINER_OB_LIGHT')
+        layout.operator("sukkah.reset_defaults", icon='FILE_REFRESH')
+
+def register_ui():
+    try:
+        bpy.utils.unregister_class(SUKKAH_OT_update_all)
+        bpy.utils.unregister_class(SUKKAH_OT_reset_defaults)
+        bpy.utils.unregister_class(SUKKAH_PT_panel)
+    except: pass
+    
+    bpy.types.Scene.sukkah_wall_height = bpy.props.FloatProperty(default=3.0, min=1.5, soft_max=1000.0)
+    bpy.types.Scene.sukkah_width = bpy.props.FloatProperty(default=3.0, min=1.0, soft_max=1000.0)
+    bpy.types.Scene.sukkah_length = bpy.props.FloatProperty(default=3.0, min=1.0, soft_max=1000.0)
+    
+    bpy.types.Scene.schach_hole_percent = bpy.props.IntProperty(default=50, min=10, max=90)
+    bpy.types.Scene.sukkah_lat = bpy.props.FloatProperty(default=31.77, min=-90.0, max=90.0, update=update_sun_position)
+    bpy.types.Scene.sukkah_month = bpy.props.IntProperty(default=10, min=1, max=12, update=update_sun_position)
+    bpy.types.Scene.sukkah_day = bpy.props.IntProperty(default=15, min=1, max=31, update=update_sun_position)
+    bpy.types.Scene.sukkah_time = bpy.props.FloatProperty(default=14.0, min=6.0, max=18.0, update=update_sun_position)
+        
+    bpy.utils.register_class(SUKKAH_OT_update_all)
+    bpy.utils.register_class(SUKKAH_OT_reset_defaults)
+    bpy.utils.register_class(SUKKAH_PT_panel)
+
+# ==========================================
+# 7. יצירת הסצנה המלאה
+# ==========================================
+register_ui()
+
+bpy.ops.mesh.primitive_plane_add(size=1, location=(0, 0, 0)) 
+floor = bpy.context.object
+floor.name = "Floor"
+assign_material_v5(floor, "Stone_Floor", (0.8, 0.75, 0.65, 1), 0.9)
+
+wall_data = [
+    ("Wall_North", (0, 1.525), (3.1, 0.05)),
+    ("Wall_South", (0, -1.525), (3.1, 0.05)),
+    ("Wall_East", (1.525, 0), (0.05, 3.0)),
+    ("Wall_West", (-1.525, 0), (0.05, 3.0))
+]
+for name, loc, scale in wall_data:
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(loc[0], loc[1], 1.1))
+    wall = bpy.context.object
+    wall.name = name
+    wall.scale = (scale[0], scale[1], 2.2) 
+    assign_material_v5(wall, "Fabric_Wall", (0.9, 0.88, 0.85, 1), 1.0)
+    
+    if name == "Wall_South":
+        wall.visible_camera = False
+        wall.display_type = 'WIRE'
+
+bpy.ops.object.light_add(type='SUN', location=(0, 0, 5))
+sun = bpy.context.object
+sun.name = "Physical_Sun"
+sun.data.energy = 1.5 
+sun.data.angle = 0.009
+sun.data.color = (1.0, 0.95, 0.85)
+
+col_text = (1.0, 1.0, 1.0, 1)
+col_bg = (0.05, 0.05, 0.05, 1)
+
+for prefix in ["Dims", "Schach", "Shadow"]:
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, 0.015))
+    bg = bpy.context.object
+    bg.name = f"{prefix}_BG"
+    assign_material_v5(bg, "Text_BG", col_bg, 0.9)
+
+    bpy.ops.object.text_add(location=(0, 0, 0.035))
+    txt = bpy.context.object
+    txt.name = f"{prefix}_Meter"
+    txt.data.align_x = 'CENTER' 
+    txt.data.align_y = 'CENTER'
+    assign_material_v5(txt, "Text_Mat", col_text, 0.5, emission=0.1)
+
+bpy.ops.object.camera_add(location=(0, -3.5, 1.6))
+camera = bpy.context.object
+camera.name = "Camera"
+bpy.context.scene.camera = camera
+
+update_sun_position(bpy.context.scene, bpy.context)
+update_everything(bpy.context.scene, bpy.context)
